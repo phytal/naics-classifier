@@ -1,9 +1,9 @@
-streamlit
 pandas
 openai
-faiss==1.5.3
+faiss-cpu
 beautifulsoup4
 openpyxl
 pydantic-ai
 sklearn
 numpy
+streamlit

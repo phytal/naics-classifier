@@ -1,7 +1,7 @@
 streamlit
 pandas
 openai
-faiss
+faiss==1.5.3
 beautifulsoup4
 openpyxl
 pydantic-ai

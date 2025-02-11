@@ -7,3 +7,4 @@ pydantic-ai
 scikit-learn
 numpy
 streamlit
+sentence_transformers

@@ -1,20 +1,38 @@
 from openai import OpenAI
 import re
-from pydantic import BaseModel, Field, ValidationError
-from typing import Optional, Tuple
+from pydantic import BaseModel, Field, ValidationError, ConfigDict
+from typing import Optional, Tuple, List, Dict
 import pandas as pd
 from utils import rate_limited, throttled
-from pydantic_ai import Agent
+from pydantic_ai import Agent, RunContext, Tool
+from pydantic_ai.usage import UsageLimits
+from pydantic_ai.exceptions import ModelRetry
 import os
 import logging
+from vector_index import NAICSVectorIndex, create_naics_search_tool
+import asyncio
+
+class NAICSDependencies(BaseModel):
+    """Dependencies for NAICS classification"""
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    
+    vector_index: NAICSVectorIndex = Field(..., description="FAISS vector index for NAICS search")
+    company_info: str = Field(..., description="Company information to classify")
 
 class NAICSResponse(BaseModel):
-    code: str = Field(..., description="NAICS Code")
+    code: str = Field(..., pattern=r"^\d{6}$", description="Primary NAICS Code")
+    industries: List[str] = Field(..., min_items=1, description="Matched industry categories")
     confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence Percentage")
-    reason: str = Field(..., description="Brief Reason")
+    reason: str = Field(..., max_length=280, description="Classification rationale")
+    candidates: List[Dict] = Field(..., description="Vector search results")
+
+class ClassificationError(Exception):
+    def __init__(self, message: str, candidates: Optional[List[Dict]] = None):
+        super().__init__(message)
+        self.candidates = candidates
 
 class NAICSClassifier:
-    def __init__(self, openai_api_key: str, perplexity_api_key: str):
+    def __init__(self, openai_api_key: str, perplexity_api_key: str, naics_df: pd.DataFrame):
         os.environ["OPENAI_API_KEY"] = openai_api_key
         self.openai_client = OpenAI(api_key=openai_api_key)
         self.perplexity_client = OpenAI(
@@ -23,15 +41,70 @@ class NAICSClassifier:
         )
         self.test_connection()
         self.consecutive_errors = 0
-        self.naics_analyzer = Agent(
-            'openai:gpt-4o-mini',
-            system_prompt="""You are an expert at NAICS classification. Follow these rules:
+        self.vector_index = NAICSVectorIndex(naics_df)
+        
+        # Create agent with improved retry configuration
+        self.react_agent = Agent(
+            'openai:gpt-4o',
+            deps_type=NAICSDependencies,
+            result_type=NAICSResponse,
+            system_prompt="""
+You are an expert at NAICS classification. Follow these rules:
 1. Always return valid 6-digit NAICS codes
-2. If uncertain, return code 999999 with confidence <0.5
-3. Format codes as strings like "541511" """,
-            result_type=NAICSResponse
+2. If you have insufficient information about the company or are uncertain, return code 999999
+3. Format codes as strings like "541511"
+4. Return a holistic confidence score based on the information provided
+
+Call the tool `naics_vector_search` to search the NAICS database using vector similarity. Call this tool AT MOST twice. Based on the given context, pass ONLY ONE NAICS classifier to the tool.
+Ignore the score tied to the tool. Use the tool to get the most relevant NAICS codes for the company.
+
+Always return your final answer in JSON format with no delimiters. For example:
+{
+  "code": "541511",
+  "industries": ["Custom Computer Programming Services"],
+  "confidence": 0.8,
+  "reason": "The business primarily does software consulting",
+  "candidates": [{"2022 NAICS Code": "541511", "2022 NAICS Title": "Custom Computer Programming Services", "similarity_score": 0.8}]
+}
+""",
+            retries=5,              # Increased retries
         )
+        
+        self.register_tools()
     
+    def register_tools(self):
+        @self.react_agent.tool(retries=4)
+        async def naics_vector_search(ctx: RunContext[NAICSDependencies], query: str) -> Dict:
+            """Search NAICS database using vector similarity"""
+            try:                
+                print(f"Searching NAICS database for: {query}")
+                # Get hybrid search results
+                matches = ctx.deps.vector_index.hybrid_search(query)
+                print(f"Hybrid search results")
+                if not matches:
+                    raise ValueError("No matches found in search")
+                
+                return matches
+            except Exception as e:
+                raise ModelRetry(f"Search failed: {str(e)}") from e
+
+    # def register_validators(self):
+    #     @self.react_agent.result_validator
+    #     def validate_naics_result(result: NAICSResponse):
+    #         """Multi-field code validation"""
+    #         print('result:', result)
+    #         print('candidates', result.candidates)
+            
+    #         code_fields = ['2022 NAICS Code', 'code', 'naics_code']
+    #         code_matches = any(
+    #             str(c.get(field)) == result.code 
+    #             for c in result.candidates 
+    #             for field in code_fields
+    #         )
+            
+    #         if not code_matches:
+    #             raise ModelRetry(f"Code {result.code} not found in any candidate field")
+
     def test_connection(self):
         """Test OpenAI API connection"""
         try:
@@ -57,37 +130,6 @@ class NAICSClassifier:
         if len(cleaned.strip()) < 3:
             return None
         return cleaned.strip()
-
-    @throttled(base_delay=2, max_delay=30)
-    @rate_limited(max_requests=10, time_window=60)
-    def web_search_company(self, query):
-        """Search web for company information with rate limiting"""
-        try:
-            # Clean and validate query
-            cleaned_query = self.clean_search_query(query)
-            if not cleaned_query:
-                print(f"Invalid search query: {query}")
-                return None
-                
-            # Add company-related keywords
-            search_query = f"{cleaned_query} company business"
-            
-            results = list(self.ddg.text(
-                keywords=search_query,
-                region="wt-wt",
-                safesearch=False,
-                max_results=10
-            ))
-            
-            if not results:
-                print(f"No results found for: {search_query}")
-                return None
-                
-            return results
-            
-        except Exception as e:
-            print(f"Error searching {query}: {str(e)}")
-            return None
 
     def keyword_match_naics(self, company_name: str, naics_df: pd.DataFrame) -> Tuple[Optional[str], float, str]:
         keywords = re.findall(r'\b\w{4,}\b', company_name.lower())
@@ -115,7 +157,7 @@ class NAICSClassifier:
         
         try:
             response = self.perplexity_client.chat.completions.create(
-                model="sonar",
+                model="sonar-pro",
                 messages=messages,
                 max_tokens=1024
             )
@@ -125,8 +167,15 @@ class NAICSClassifier:
             return f"Error retrieving company information: {str(e)}"
 
     async def process_company(self, company_row: pd.Series, naics_df: pd.DataFrame) -> tuple:
-        current_delay = None
         try:
+            # Circuit breaker pattern
+            if self.consecutive_errors > 3:
+                await asyncio.sleep(2 ** self.consecutive_errors)
+            
+            # Add pre-validation
+            if not self.validate_company_input(company_row):
+                raise ClassificationError("Invalid input data")
+            
             company_name = str(company_row['Company']).strip()
             city = str(company_row.get('City', '')).strip()
             website = str(company_row.get('Web Site', '')).strip()
@@ -147,55 +196,78 @@ class NAICSClassifier:
             
             try:
                 web_content = self.search_company_info(company_name)
-            except Exception as e:
-                if "Rate limit" in str(e):
-                    return None, None, 0.0, f"Rate limited: {str(e)}"
-                return None, None, 0.0, f"Search failed: {str(e)}"
-            
-            if not isinstance(web_content, (str, list)) or not web_content:
-                return None, None, 0.0, "No web content found"
+                response = await self.classify_with_react(company_info + ' ' + web_content)
+                self.consecutive_errors = 0  # Reset on success
                 
-            # Convert list of search results to string if needed
-            if isinstance(web_content, list):
-                web_content = ' '.join([str(r) for r in web_content[:3]])
-            
-            if web_content:
-                try:
-                    analysis_result = (await self.naics_analyzer.run(
-                        f"Company: {company_name}\nContext: {web_content}"
-                    )).data
-
-                    # Ensure code format validation
-                    if not re.match(r"^\d{6}$", analysis_result.code):
-                        raise ValidationError(f"Invalid NAICS code format: {analysis_result.code}")
-
-                    code = analysis_result.code
-                    confidence = analysis_result.confidence
-                    reason = analysis_result.reason
-                    source = 'Web Analysis'
-
-                except ValidationError as e:
-                    logging.warning(f"Validation failed for {company_name}: {e}")
-                    code = "999999"
-                    confidence = 0.0
-                    reason = f"Validation error: {e}"
-                    source = 'Web Analysis'
-                except Exception as e:
-                    logging.error(f"API error: {str(e)}")
-                    code = "999999"
-                    confidence = 0.0
-                    reason = f"API error: {str(e)}"
-                    source = 'Web Analysis'
-            else:
-                code, confidence, reason = self.keyword_match_naics(company_name, naics_df)
-                source = 'Keyword Match'
-            
-            description = None
-            if code and code in naics_df['2022 NAICS Code'].astype(str).values:
-                description = naics_df[naics_df['2022 NAICS Code'].astype(str) == code]['2022 NAICS Title'].iloc[0]
-            
-            return code, description, confidence, f"{source}: {reason}"
+                if response.confidence < 0.2:
+                    raise ClassificationError("Low confidence", response.candidates)
+                    
+                return (
+                    response.code,
+                    next((c['2022 NAICS Title'] for c in response.candidates if str(c['2022 NAICS Code']) == response.code), None),
+                    response.confidence,
+                    response.reason
+                )
+                
+            except ClassificationError as e:
+                self.consecutive_errors += 1
+                code, confidence, reason = self.hybrid_fallback(company_name, e.candidates, naics_df)
+                return code, None, confidence, reason
+            except Exception as e:
+                print(f"Error processing company {company_row['Company']}: {str(e)}")
+                return None, None, 0.0, f"Processing error: {str(e)}"
         
         except Exception as e:
-            print(f"Error processing company {company_row['Company']}: {str(e)}")
+            self.log_error(e, company_row)
             return None, None, 0.0, f"Processing error: {str(e)}"
+
+    @staticmethod
+    def validate_naics_result(result: NAICSResponse, candidates: List[Dict]) -> bool:
+        """Validate that selected code exists in candidates"""
+        return any(str(c.get('2022 NAICS Code')) == result.code for c in candidates)
+
+    async def classify_with_react(self, company_info: str) -> NAICSResponse:
+        """Execute ReAct classification with improved limits"""
+        deps = NAICSDependencies(
+            vector_index=self.vector_index,
+            company_info=company_info
+        )
+        
+        result = await self.react_agent.run(
+            f"Classify this business:\n{company_info}",
+            deps=deps,
+            usage_limits=UsageLimits(
+                request_tokens_limit=10000, 
+                response_tokens_limit=10000,
+                total_tokens_limit=20000
+            )
+        )
+        return result.data
+
+    def hybrid_fallback(self, company_name: str, candidates: Optional[List[Dict]], naics_df: pd.DataFrame) -> Tuple[Optional[str], float, str]:
+        """Combined fallback strategy using candidates and keywords"""
+        # Try using candidates first if available
+        if candidates:
+            best_candidate = max(candidates, key=lambda x: x.get('similarity_score', 0))
+            return (
+                str(best_candidate.get('2022 NAICS Code')),
+                float(best_candidate.get('similarity_score', 0.4)),
+                "Fallback from candidates"
+            )
+        
+        # Fall back to keyword matching
+        return self.keyword_match_naics(company_name, naics_df)
+
+    def validate_company_input(self, company_row: pd.Series) -> bool:
+        """Validate company input data"""
+        try:
+            company_name = str(company_row['Company']).strip()
+            return bool(company_name and company_name.lower() != 'nan')
+        except:
+            return False
+
+    def log_error(self, error: Exception, company_row: pd.Series):
+        """Log classification errors with context"""
+        company_name = str(company_row.get('Company', 'UNKNOWN'))
+        logging.error(f"Error processing {company_name}: {str(error)}")
+        self.consecutive_errors += 1

@@ -2,12 +2,58 @@ import streamlit as st
 import pandas as pd
 from classifier import NAICSClassifier
 import os
-from time import sleep
 import asyncio
+import atexit
+import nest_asyncio
+nest_asyncio.apply()
 
 # Page configuration
 st.set_page_config(page_title="NAICS Classifier", layout="wide")
 st.title("NAICS Code Classification Tool")
+
+def cleanup_resources():
+    """Enhanced cleanup function"""
+    try:
+        # Clean up classifier resources
+        if 'classifier' in st.session_state and st.session_state.classifier:
+            try:
+                del st.session_state.classifier.vector_index
+                del st.session_state.classifier
+            except:
+                pass
+        
+        # Clean up any running event loops
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.stop()
+            if not loop.is_closed():
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                loop.close()
+        except Exception:
+            pass
+        
+        # Force garbage collection
+        import gc
+        gc.collect()
+        
+    except Exception as e:
+        st.error(f"Error during cleanup: {e}")
+
+# Register cleanup
+atexit.register(cleanup_resources)
+
+# Initialize session state for cleanup
+if 'cleanup_registered' not in st.session_state:
+    st.session_state.cleanup_registered = False
+    
+if not st.session_state.cleanup_registered:
+    # Add cleanup to session state
+    st.session_state.cleanup = cleanup_resources
+    st.session_state.cleanup_registered = True
 
 # Session state initialization
 if 'classifier' not in st.session_state:
@@ -30,6 +76,30 @@ if 'status_text' not in st.session_state:
     st.session_state.status_text = None
 if 'results' not in st.session_state:
     st.session_state.results = []
+if 'naics_df' not in st.session_state:
+    st.session_state.naics_df = None
+
+class AsyncEventLoopHandler:
+    """Handle async event loop lifecycle"""
+    def __init__(self):
+        self.loop = None
+        
+    def get_loop(self):
+        if self.loop is None or self.loop.is_closed():
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+        return self.loop
+        
+    def run_async(self, coro):
+        loop = self.get_loop()
+        try:
+            return loop.run_until_complete(coro)
+        except Exception as e:
+            raise e
+
+# Initialize event loop handler in session state
+if 'event_loop_handler' not in st.session_state:
+    st.session_state.event_loop_handler = AsyncEventLoopHandler()
 
 # Sidebar configuration
 with st.sidebar:
@@ -37,16 +107,14 @@ with st.sidebar:
     api_key = st.text_input("OpenAI API Key", type="password")
     perplexity_api_key = st.text_input("Perplexity API Key", type="password")
     st.session_state.debug = st.checkbox("Enable Debug Mode")
-    if api_key and api_key.startswith('sk-'):
-        try:
-            if not perplexity_api_key:
-                st.warning("Perplexity API key is required for company research")
-            else:
-                st.session_state.classifier = NAICSClassifier(api_key, perplexity_api_key)
-                st.success("API keys validated")
-        except Exception as e:
-            st.error(f"Invalid API key: {str(e)}")
-    st.info("Enter your API keys to enable classification")
+    
+    # Remove classifier initialization from sidebar
+    if not api_key or not api_key.startswith('sk-'):
+        st.warning("Please enter a valid OpenAI API key")
+    elif not perplexity_api_key:
+        st.warning("Perplexity API key is required for company research")
+    
+    st.info("Upload NAICS file and enter API keys to enable classification")
 
 # File validation function
 def validate_files(naics_df, company_df):
@@ -89,10 +157,26 @@ with st.form("naics_classifier"):
             if not validate_files(naics_df, company_df):
                 st.stop()
             
+            # Initialize classifier with NAICS data
+            try:
+                st.session_state.classifier = NAICSClassifier(api_key, perplexity_api_key, naics_df)
+                st.success("Classifier initialized successfully")
+            except Exception as e:
+                st.error(f"Failed to initialize classifier: {str(e)}")
+                st.stop()
+            
             # Debug information
             if st.session_state.debug:
                 st.write("NAICS DF Shape:", naics_df.shape)
                 st.write("Company DF Columns:", list(company_df.columns))
+            
+            # Store naics_df in session state
+            st.session_state.naics_df = naics_df
+            
+            # Verify classifier is initialized
+            if st.session_state.classifier is None:
+                st.error("Classifier not initialized. Please check API keys and try again.")
+                st.stop()
             
             # Reset counters
             st.session_state.error_count = 0
@@ -105,44 +189,98 @@ with st.form("naics_classifier"):
             error_text = st.empty()
             
             total = len(company_df)
-            for index in range(total):
-                row = company_df.iloc[index]
-                try:
-                    progress = (index + 1) / total
-                    progress_bar.progress(progress)
-                    status_text.text(f"Processing {index+1}/{total}: {row['Company']}")
-                    
-                    result = asyncio.run(st.session_state.classifier.process_company(row, naics_df))
-                    st.session_state.results.append(result)
-                    st.session_state.total_processed += 1
-                    
-                except Exception as e:
-                    st.session_state.results.append((None, None, 0.0, f"Error: {str(e)}"))
+
+            # Define progress update function
+            def update_progress(current, total, company, success):
+                progress = current / total
+                progress_bar.progress(progress)
+                status_text.text(f"Processing {current}/{total}: {company}")
+                if not success:
                     st.session_state.error_count += 1
-                    error_text.error(f"Errors: {st.session_state.error_count}/{index+1} companies")
+                    error_text.error(f"Errors: {st.session_state.error_count}/{current} companies")
+                st.session_state.total_processed = current
                 
                 # Update status
                 status_color = "🟡" if st.session_state.error_count > 0 else "🟢"
-                status_text.markdown(f"{status_color} Processed: {st.session_state.total_processed}/{total} | Errors: {st.session_state.error_count}")
+                status_text.markdown(f"{status_color} Processed: {current}/{total} | Errors: {st.session_state.error_count}")
+
+            # Modify the processing loop to use event loop handler
+            async def process_companies(classifier, company_df, naics_df, progress_callback):
+                """Process companies using managed event loop"""
+                results = []
+                for index in range(len(company_df)):
+                    try:
+                        row = company_df.iloc[index]
+                        result = await classifier.process_company(row, naics_df)
+                        results.append(result)
+                        progress_callback(index + 1, len(company_df), row['Company'], True)
+                    except Exception as e:
+                        results.append((None, None, 0.0, f"Error: {str(e)}"))
+                        progress_callback(index + 1, len(company_df), row['Company'], False)
+                return results
+
+            try:
+                # Process companies using managed event loop
+                st.session_state.results = st.session_state.event_loop_handler.run_async(
+                    process_companies(
+                        st.session_state.classifier,
+                        company_df,
+                        naics_df,
+                        update_progress
+                    )
+                )
                 
-                sleep(0.1)  # Adjust delay as needed
+                # Rest of processing logic
+                for i, result in enumerate(st.session_state.results):
+                    naics_code, description, confidence, source = result
+                    
+                    # If description is None but we have a valid code, look up the description
+                    if description is None and naics_code is not None:
+                        # Convert NAICS codes to strings for comparison
+                        naics_code_str = str(naics_code)
+                        matching_desc = naics_df[naics_df['2022 NAICS Code'].astype(str) == naics_code_str]['2022 NAICS Title'].iloc[0] if any(naics_df['2022 NAICS Code'].astype(str) == naics_code_str) else None
+                        description = matching_desc
+                    
+                    company_df.loc[i, ['NAICS Code', 'NAICS Description', 'Confidence', 'Source Method']] = [
+                        naics_code,
+                        description,
+                        confidence,
+                        source
+                    ]
+                
+                st.session_state.processed_data = company_df
+                
+                # Final status update
+                if st.session_state.error_count > 0:
+                    error_text.error(f"Completed with {st.session_state.error_count} errors. Check results for details.")
+                else:
+                    error_text.success("Processing complete with no errors!")
 
-            # Finalize processing: update dataframe and display results
-            for i, result in enumerate(st.session_state.results):
-                company_df.loc[i, ['NAICS Code', 'NAICS Description', 'Confidence', 'Source Method']] = result
-            st.session_state.processed_data = company_df
-            
-            # Final status update
-            if st.session_state.error_count > 0:
-                error_text.error(f"Completed with {st.session_state.error_count} errors. Check results for details.")
-            else:
-                error_text.success("Processing complete with no errors!")
+                # Optionally, clear the progress bar if you wish
+                progress_bar.empty()
+                st.session_state.current_index = 0  # Reset current_index
 
-            # Optionally, clear the progress bar if you wish
-            progress_bar.empty()
-            st.session_state.current_index = 0  # Reset current_index
+                # Ensure cleanup after processing
+                if hasattr(st.session_state, 'cleanup'):
+                    st.session_state.cleanup()
+
+            except Exception as e:
+                st.error(f"Processing error: {str(e)}")
+                if hasattr(st.session_state, 'cleanup'):
+                    st.session_state.cleanup()
+            finally:
+                # Cleanup
+                if hasattr(st.session_state, 'event_loop_handler'):
+                    try:
+                        loop = st.session_state.event_loop_handler.loop
+                        if loop and not loop.is_closed():
+                            loop.close()
+                    except:
+                        pass
 
         except Exception as e:
+            if hasattr(st.session_state, 'cleanup'):
+                st.session_state.cleanup()
             st.error(f"Critical error processing files: {str(e)}")
             if 'progress_bar' in locals():
                 progress_bar.progress(1.0)

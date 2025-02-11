@@ -22,36 +22,25 @@ class RateLimiter:
     def add_request(self):
         self.requests.append(datetime.now())
 
-def rate_limited(max_requests=10, time_window=60, max_retries=3, initial_delay=1):
+def rate_limited(max_requests=30, time_window=60):  # Removed delays, increased max_requests
     limiter = RateLimiter(max_requests, time_window)
     
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
-            retries = 0
-            delay = initial_delay
-            
-            while retries < max_retries:
-                if limiter.can_request():
-                    try:
-                        limiter.add_request()
-                        return func(*args, **kwargs)
-                    except Exception as e:
-                        if "429" in str(e) or "Too Many Requests" in str(e):
-                            retries += 1
-                            time.sleep(delay)
-                            delay *= 2  # Exponential backoff
-                            continue
-                        raise e
-                else:
-                    time.sleep(1)  # Wait before checking again
-                    
-            raise Exception("Rate limit exceeded after maximum retries")
+            if limiter.can_request():
+                try:
+                    limiter.add_request()
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    raise e
+            else:
+                raise Exception("Rate limit exceeded")
         return wrapper
     return decorator
 
 class ThrottledRequests:
-    def __init__(self, base_delay=2, max_delay=30, backoff_factor=2):
+    def __init__(self, base_delay=0.5, max_delay=10, backoff_factor=1.5):  # Reduced delays
         self.base_delay = base_delay
         self.max_delay = max_delay
         self.backoff_factor = backoff_factor
@@ -82,7 +71,7 @@ class ThrottledRequests:
             self.base_delay * (self.backoff_factor ** self.consecutive_errors)
         )
 
-def throttled(base_delay=2, max_delay=30, backoff_factor=2):
+def throttled(base_delay=0.5, max_delay=10, backoff_factor=1.5):  # Updated parameters
     throttler = ThrottledRequests(base_delay, max_delay, backoff_factor)
     
     def decorator(func):

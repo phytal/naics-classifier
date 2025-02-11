@@ -1,8 +1,10 @@
 streamlit>=1.24.0
 pandas
 openai
-duckduckgo-search
+faiss
 beautifulsoup4
 pydantic
 openpyxl
 pydantic-ai
+sklearn
+numpy

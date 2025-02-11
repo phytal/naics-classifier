@@ -5,6 +5,5 @@ beautifulsoup4
 openpyxl
 pydantic-ai
 scikit-learn
-numpy
 streamlit
 sentence-transformers

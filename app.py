@@ -1,11 +1,8 @@
 import streamlit as st
 import pandas as pd
 from classifier import NAICSClassifier
-import os
 import asyncio
 import atexit
-import nest_asyncio
-nest_asyncio.apply()
 
 # Page configuration
 st.set_page_config(page_title="NAICS Classifier", layout="wide")
